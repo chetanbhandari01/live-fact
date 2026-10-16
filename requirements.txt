@@ -1,0 +1,34 @@
+# Web framework and server. Without these the backend cannot start:
+# `backend.main` imports fastapi/uvicorn and `backend.config` uses
+# pydantic-settings to read the environment.
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Multipart form parsing, required by the `/ingestion/audio` and
+# `/ingestion/video` upload routes (`File(...)` / `Form(...)`). FastAPI raises
+# at import time without it, so its absence stops the whole application from
+# starting, not just the upload endpoints.
+python-multipart>=0.0.9
+
+# WebSocket test client and async test support for the pytest suite.
+websockets>=12.0
+pytest>=7.0.0
+pytest-asyncio>=0.23.0
+
+# Voice pipeline (desktop capture -> AssemblyAI -> backend).
+assemblyai>=1.6.0
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0
+
+# Persistence: Postgres driver for the Supabase fact-check cache and session
+# history. Imported lazily, so the backend still starts if the package is
+# absent -- it then runs with persistence disabled.
+asyncpg>=0.29.0
+
+yt-dlp

@@ -1,0 +1,270 @@
+"""Application configuration loaded exclusively from environment variables.
+
+Secrets are read from the environment (optionally via a local ``.env`` file)
+and are never written to logs, never returned by any HTTP route, and never
+placed in the browser payload.
+"""
+
+import json
+from functools import lru_cache
+from typing import Annotated, List, Literal, Optional
+
+from pydantic import Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+Environment = Literal["development", "production", "test"]
+
+#: Backup models the AssemblyAI LLM Gateway tries, in order, when the primary
+#: model is rate limited or errors. Sent per request as the Gateway's native
+#: ``fallbacks`` array, so failover happens server-side without extra client
+#: round trips. AssemblyAI accepts up to two.
+DEFAULT_LLM_GATEWAY_FALLBACK_MODELS = ["gemini-2.5-flash-lite", "gpt-5-nano"]
+
+#: How many of the configured fallbacks the Gateway may try.
+LLM_GATEWAY_FALLBACK_DEPTH = 2
+
+# Origins allowed during local development. Production must configure
+# CORS_ORIGINS explicitly; a wildcard is never assumed.
+LOCAL_DEV_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+
+
+class Settings(BaseSettings):
+    """Runtime settings for the backend service."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # --- Service identity -------------------------------------------------
+    app_name: str = Field(default="Live Fact-Checker Backend")
+    app_version: str = Field(default="0.1.0")
+    environment: Environment = Field(default="development")
+
+    # --- HTTP server ------------------------------------------------------
+    host: str = Field(default="127.0.0.1")
+    port: int = Field(default=8000, ge=1, le=65535)
+
+    # --- CORS -------------------------------------------------------------
+    # `NoDecode` stops pydantic-settings from running json.loads() on the raw
+    # environment value. Without it, any CORS_ORIGINS that is not valid JSON
+    # (for example the comma-separated form this project documents) raises
+    # SettingsError while the settings object is being built, which fails the
+    # module import and takes the whole application down.
+    cors_origins: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: list(LOCAL_DEV_ORIGINS),
+        description="Comma-separated list of allowed browser origins.",
+    )
+
+    # --- Logging ----------------------------------------------------------
+    log_level: str = Field(default="INFO")
+    log_json: bool = Field(
+        default=False,
+        description="Emit machine-readable JSON logs instead of human-readable text.",
+    )
+
+    # --- Engine wiring ----------------------------------------------------
+    use_mock_engines: bool = Field(
+        default=False,
+        description=(
+            "False (the default) selects the real modules: claim extraction "
+            "runs through LLMClaimEngine against the OpenAI-compatible LLM "
+            "Gateway, and verification through the existing `verification` "
+            "package against the live search provider.\n\n"
+            "True selects the deterministic offline mock engines. It is opt-in "
+            "so it can never be enabled silently: mock mode is a test and "
+            "offline-development affordance, never a production default. "
+            "Set it explicitly for offline work."
+        ),
+    )
+
+    # --- Credentials (server-side only, never exposed to the browser) -----
+    assemblyai_api_key: Optional[SecretStr] = Field(default=None)
+    llm_gateway_api_key: Optional[SecretStr] = Field(default=None)
+    llm_gateway_base_url: str = Field(
+        default="https://llm-gateway.assemblyai.com/v1",
+        description="Base URL for the LLM Gateway API (OpenAI-compatible).",
+    )
+    llm_gateway_model: str = Field(
+        default="qwen3.5-4b-32k-fast",
+        description="Model name to use for the LLM Gateway.",
+    )
+    llm_gateway_fallback_models: Annotated[List[str], NoDecode] = Field(
+        default_factory=lambda: list(DEFAULT_LLM_GATEWAY_FALLBACK_MODELS),
+        description=(
+            "Comma-separated backup models for the Gateway's native `fallbacks` "
+            "field. When the primary is rate limited or errors, the Gateway "
+            "tries these server-side before returning an error. Empty disables "
+            "failover and relies on client-side retry alone."
+        ),
+    )
+    llm_gateway_fallback_depth: int = Field(
+        default=LLM_GATEWAY_FALLBACK_DEPTH,
+        ge=0,
+        le=2,
+        description="Maximum number of fallback models the Gateway may try.",
+    )
+    search_api_key: Optional[SecretStr] = Field(default=None)
+    supabase_database_url: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Postgres connection string for the persistent fact-check cache and "
+            "session history. Server-side only; never exposed to the browser. "
+            "When unset, persistence is disabled and the live pipeline is "
+            "unaffected."
+        ),
+    )
+    fact_cache_ttl_seconds: int = Field(
+        default=604_800,
+        ge=0,
+        description=(
+            "Lifetime of a cached verification verdict in seconds. Defaults to "
+            "7 days. Expiry is stored on the row, so a stale verdict can never "
+            "be served even if the process never runs a sweep."
+        ),
+    )
+    persistence_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0.0,
+        description=(
+            "Per-statement timeout for persistence queries. Persistence is an "
+            "optimisation: exceeding this degrades to live retrieval rather "
+            "than delaying or failing a verification."
+        ),
+    )
+    search_provider: str = Field(
+        default="tavily",
+        description=(
+            "Search provider backing WebSearchRetriever. `tavily` is the only "
+            "registered adapter; an unknown name is reported per request as a "
+            "structured VERIFICATION_FAILED event rather than at startup."
+        ),
+    )
+
+    # --- P1 fact-checking quality (opt-in, off by default) --------------
+    #
+    # Both layers below are additive enhancements to a pipeline that already
+    # works. Neither changes any existing verdict: the claim layer only ever
+    # hands the existing pipeline a subset of what it was already handed, and
+    # the conflict layer delegates to the existing checker and returns its
+    # result untouched unless two independent credible sources disagree.
+    #
+    # They default to false so that deploying this code cannot silently alter
+    # the behaviour of a running system. Turn one on deliberately.
+    claim_refinement_enabled: bool = Field(
+        default=False,
+        description=(
+            "Run the additive claim-intelligence layer in front of the claim "
+            "engine: compound claims are split into their independent "
+            "assertions, text that is not a factual claim (a question, an "
+            "opinion, an instruction, small talk) is not fact-checked, and a "
+            "claim identical to one already processed in the session is "
+            "skipped. Claims classified as factual reach the existing "
+            "verification pipeline unchanged. Off by default, so the default "
+            "pipeline is exactly the one that was already working; set true to "
+            "opt in."
+        ),
+    )
+    conflict_detection_enabled: bool = Field(
+        default=False,
+        description=(
+            "Report a claim as UNVERIFIABLE when two or more credible sources "
+            "from different domains genuinely disagree and neither is clearly "
+            "better evidenced. Implemented as a subclass of the existing "
+            "checker that calls it first and returns its verdict unchanged for "
+            "every non-conflicting case, so TRUE and FALSE behaviour is "
+            "preserved. Off by default; set true to opt in."
+        ),
+    )
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_origins(cls, value: object) -> object:
+        """Accept a comma-separated string, a JSON array, or a real list.
+
+        Deployment platforms often store a variable as either
+        ``https://a.example.com,https://b.example.com`` or
+        ``["https://a.example.com","https://b.example.com"]``; both must work
+        without raising.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return list(LOCAL_DEV_ORIGINS)
+            if stripped.startswith("["):
+                try:
+                    decoded = json.loads(stripped)
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, list):
+                    return [str(item).strip() for item in decoded if str(item).strip()]
+            return [origin.strip() for origin in stripped.split(",") if origin.strip()]
+        return value
+
+    @field_validator("llm_gateway_fallback_models", mode="before")
+    @classmethod
+    def _split_fallback_models(cls, value: object) -> object:
+        """Accept a comma-separated string, a JSON array, or a real list."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                try:
+                    decoded = json.loads(stripped)
+                except json.JSONDecodeError:
+                    decoded = None
+                if isinstance(decoded, list):
+                    return [str(item).strip() for item in decoded if str(item).strip()]
+            return [m.strip() for m in stripped.split(",") if m.strip()]
+        return value
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, value: str) -> str:
+        level = value.strip().upper()
+        if level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}:
+            return "INFO"
+        return level
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+    def resolved_cors_origins(self) -> List[str]:
+        """Return CORS origins, rejecting an unsafe wildcard in production."""
+        origins = [origin for origin in self.cors_origins if origin]
+        if not origins:
+            return list(LOCAL_DEV_ORIGINS)
+        if self.is_production and "*" in origins:
+            raise ValueError(
+                "CORS_ORIGINS='*' is not permitted when ENVIRONMENT=production. "
+                "List the deployed frontend origin(s) explicitly."
+            )
+        return origins
+
+    def has_assemblyai_key(self) -> bool:
+        return bool(self.assemblyai_api_key and self.assemblyai_api_key.get_secret_value())
+
+    def has_llm_gateway_key(self) -> bool:
+        return bool(self.llm_gateway_api_key and self.llm_gateway_api_key.get_secret_value())
+
+    def has_search_key(self) -> bool:
+        return bool(self.search_api_key and self.search_api_key.get_secret_value())
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the cached settings instance.
+
+    Cached so the environment is parsed once per process. Tests can clear the
+    cache with ``get_settings.cache_clear()`` after changing the environment.
+    """
+    return Settings()
